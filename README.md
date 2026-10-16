@@ -76,3 +76,7 @@ The log goes to `~/.cache/wpe.log`.
 - `linux-wallpaperengine` draws on the `bottom` layer-shell layer, so it sits above daemons like swww/awww/hyprpaper. You can leave those running (for example, so HyDE's wallbash theming keeps working).
 - The wallpaper pauses automatically while a window is fullscreen.
 - Web wallpapers often don't render correctly in `linux-wallpaperengine`. Scene and video wallpapers work best.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
