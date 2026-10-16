@@ -73,7 +73,7 @@ stop() { pkill -x linux-wallpaper || pkill -f '^linux-wallpaperengine' || true; 
 start() {
     [[ -f "$CONF" ]] || { echo "no wallpapers set yet; try: wpe set 'Misty forest'" >&2; exit 1; }
     stop
-    local args=()
+    local args=() mon id
     while read -r mon id; do
         [[ -n "${mon:-}" && -n "${id:-}" ]] && args+=(--screen-root "$mon" --bg "$id")
     done <"$CONF"
@@ -93,6 +93,15 @@ start() {
 
     cd "$WORKSHOP"
     setsid -f linux-wallpaperengine --assets-dir "$ASSETS" "${EXTRA_ARGS[@]}" "${args[@]}" >"$LOG" 2>&1
+    # scenes are parsed up front, so a wallpaper the engine can't handle dies within a few seconds
+    for _ in {1..12}; do
+        sleep 0.25
+        if ! pgrep -x linux-wallpaper >/dev/null; then
+            CRASH_REASON=$(grep -a -m1 -oP '(?<=what\(\):\s{2}).*|\bERROR\b.*' "$LOG" || true)
+            echo "linux-wallpaperengine crashed: ${CRASH_REASON:-see $LOG}" >&2
+            return 1
+        fi
+    done
     if [[ $sync == 1 ]]; then
         bash -c "$(declare -f monitor_geometry hyde_sync); CACHE='$CACHE'; hyde_sync \"\$@\"" \
             _ "$first_mon" "$first_id" "$frame" >>"$LOG" 2>&1 </dev/null &
@@ -120,12 +129,19 @@ set)
     target="${3:-all}"
     mkdir -p "$(dirname "$CONF")"
     touch "$CONF"
+    cp "$CONF" "$CONF.prev"
     if [[ "$target" == all ]]; then
         monitors | while read -r m; do echo "$m $id"; done >"$CONF"
     else
         { grep -v "^$target " "$CONF" || true; echo "$target $id"; } >"$CONF.tmp" && mv "$CONF.tmp" "$CONF"
     fi
-    start
+    if ! start; then
+        mv "$CONF.prev" "$CONF"
+        [[ -s "$CONF" ]] && { start 2>/dev/null || true; }
+        echo "Wallpaper $id failed to load (${CRASH_REASON:-engine crashed}); kept the previous one" >&2
+        exit 1
+    fi
+    rm -f "$CONF.prev"
     ;;
-*) sed -n '2,6p' "$0" | sed 's/^# \?//'; exit 1 ;;
+*) sed -n '2,7p' "$0" | sed 's/^# \?//'; exit 1 ;;
 esac

@@ -82,6 +82,7 @@ If `hyde-shell` is installed, `wpe` captures a frame of the first monitor's wall
 
 - `linux-wallpaperengine` draws on the `bottom` layer-shell layer, so it sits above daemons like swww/awww/hyprpaper. You can leave those running (for example, so HyDE's wallbash theming keeps working).
 - The wallpaper pauses automatically while a window is fullscreen.
+- If `linux-wallpaperengine` crashes on a wallpaper, `wpe set` notices, restores the previous wallpaper and reports the engine's error (shown as a toast in the GUI).
 - Web wallpapers often don't render correctly in `linux-wallpaperengine`. Scene and video wallpapers work best.
 
 ## License
