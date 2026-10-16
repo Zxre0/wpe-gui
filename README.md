@@ -7,6 +7,7 @@ A small wallpaper picker for [linux-wallpaperengine](https://github.com/Almamu/l
 - Highlights the wallpaper that's currently playing
 - Settings for mute, volume and FPS limit
 - Start/stop button
+- **HyDE integration:** a still frame of the live wallpaper becomes HyDE's wallpaper, so the rofi launcher art, wallbash colours and lockscreen match it
 - Your choices persist, so `wpe start` at login restores them
 
 It has two parts:
@@ -54,6 +55,7 @@ wpe list                     # id, type, title for every Workshop wallpaper
 wpe set "lofi cafe"          # title substring or Workshop id; all monitors
 wpe set 2370927443 DP-2      # one monitor
 wpe stop | wpe start
+wpe sync                     # re-capture the still frame pushed to HyDE
 ```
 
 ## Config
@@ -67,9 +69,14 @@ Both files live in `~/.config/wpe/`:
   SILENT=1   # 0 to enable sound
   VOLUME=15
   FPS=60
+  HYDE_SYNC=1  # 0 to leave HyDE's own wallpaper alone
   ```
 
 The log goes to `~/.cache/wpe.log`.
+
+## HyDE sync
+
+If `hyde-shell` is installed, `wpe` captures a frame of the first monitor's wallpaper whenever the wallpaper changes, using `linux-wallpaperengine --screenshot`. It saves the frame to `~/.cache/wpe/stills/<id>.png` and passes it to `wallpaper.sh --set <still> --global`. HyDE then regenerates the launcher thumbnails, wallbash colours and hyprlock background from it, and its own daemon (awww) shows the same image under the live layer. The capture only runs when the wallpaper changes, and stills are cached per wallpaper.
 
 ## Notes
 

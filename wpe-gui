@@ -78,7 +78,7 @@ def read_screens():
 
 
 def read_options():
-    opts = {"SILENT": "1", "FPS": "60", "VOLUME": "15"}
+    opts = {"SILENT": "1", "FPS": "60", "VOLUME": "15", "HYDE_SYNC": "1"}
     try:
         for line in OPTIONS.read_text().splitlines():
             if "=" in line and not line.lstrip().startswith("#"):
@@ -214,21 +214,28 @@ class Window(Adw.ApplicationWindow):
         fps = Gtk.SpinButton.new_with_range(10, 240, 5)
         fps.set_value(float(opts["FPS"]))
 
-        for r, (label, w) in enumerate([("Mute sound", mute), ("Volume", vol), ("FPS limit", fps)]):
+        hyde = Gtk.Switch(active=opts["HYDE_SYNC"] == "1", halign=Gtk.Align.END,
+                          tooltip_text="Use a still of the wallpaper for HyDE's launcher, colours and lockscreen")
+        rows = [("Mute sound", mute), ("Volume", vol), ("FPS limit", fps)]
+        if shutil.which("hyde-shell"):
+            rows.append(("Sync HyDE theme", hyde))
+        for r, (label, w) in enumerate(rows):
             grid.attach(Gtk.Label(label=label, xalign=0), 0, r, 1, 1)
             grid.attach(w, 1, r, 1, 1)
 
         def save(*_):
             vol.set_sensitive(not mute.get_active())
             write_options({"SILENT": "1" if mute.get_active() else "0",
-                           "FPS": str(int(fps.get_value())), "VOLUME": str(int(vol.get_value()))})
+                           "FPS": str(int(fps.get_value())), "VOLUME": str(int(vol.get_value())),
+                           "HYDE_SYNC": "1" if hyde.get_active() else "0"})
 
         apply_btn = Gtk.Button(label="Apply", css_classes=["suggested-action"])
         apply_btn.connect("clicked", lambda *_: (save(), self.run_wpe(["start"], "Settings applied")))
-        grid.attach(apply_btn, 0, 3, 2, 1)
+        grid.attach(apply_btn, 0, len(rows), 2, 1)
         mute.connect("notify::active", save)
         vol.connect("value-changed", save)
         fps.connect("value-changed", save)
+        hyde.connect("notify::active", save)
 
         return Gtk.Popover(child=grid)
 

@@ -4,6 +4,7 @@
 #   wpe stop                  kill the running instance
 #   wpe list                  list Workshop wallpapers (id, type, title)
 #   wpe set <id|title> [mon]  set wallpaper on a monitor (default: all) and restart
+#   wpe sync                  re-capture a still frame and push it to HyDE
 set -euo pipefail
 
 if [[ -z "${WPE_STEAM_DIR:-}" ]]; then
@@ -17,11 +18,13 @@ ASSETS="$STEAM/steamapps/common/wallpaper_engine/assets"
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/wpe/screens"
 LOG="${XDG_CACHE_HOME:-$HOME/.cache}/wpe.log"
 OPTS="${XDG_CONFIG_HOME:-$HOME/.config}/wpe/options"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/wpe"
 
 # defaults, overridable in $OPTS (shell syntax, e.g. SILENT=0)
 SILENT=1
 FPS=60
 VOLUME=15
+HYDE_SYNC=1 # push a still of the first monitor's wallpaper to HyDE (launcher, wallbash, lockscreen)
 [[ -f "$OPTS" ]] && source "$OPTS"
 EXTRA_ARGS=(--fps "$FPS")
 if [[ "$SILENT" == 1 ]]; then EXTRA_ARGS+=(--silent); else EXTRA_ARGS+=(--volume "$VOLUME"); fi
@@ -37,6 +40,34 @@ resolve() {
     basename "$(dirname "$hit")"
 }
 
+# crop geometry (WxH+X+Y) of a monitor inside linux-wallpaperengine's full-layout screenshot
+monitor_geometry() {
+    hyprctl monitors -j | python3 -I -c '
+import json, sys
+ms = json.load(sys.stdin)
+x0, y0 = min(m["x"] for m in ms), min(m["y"] for m in ms)
+m = next(m for m in ms if m["name"] == sys.argv[1])
+print("%dx%d+%d+%d" % (m["width"], m["height"], m["x"] - x0, m["y"] - y0))' "$1"
+}
+
+# wait for the screenshot, crop it to $mon and hand it to HyDE's wallpaper script
+hyde_sync() {
+    local mon="$1" id="$2" frame="$3" still="$CACHE/stills/$2.png" last=-1 size
+    if [[ ! -s "$still" ]]; then
+        for _ in {1..80}; do # up to ~20s; wait until the file stops growing
+            size=$(stat -c %s "$frame" 2>/dev/null || echo 0)
+            [[ "$size" -gt 0 && "$size" == "$last" ]] && break
+            last=$size
+            sleep 0.25
+        done
+        [[ "$size" -gt 0 ]] || { echo "wpe: no screenshot captured, skipping HyDE sync"; return; }
+        mkdir -p "$CACHE/stills"
+        magick "$frame" -crop "$(monitor_geometry "$mon")" +repage "$still.tmp.png" && mv "$still.tmp.png" "$still"
+        rm -f "$frame"
+    fi
+    hyde-shell wallpaper.sh --set "$still" --global && echo "$id" >"$CACHE/hyde-synced"
+}
+
 stop() { pkill -x linux-wallpaper || pkill -f '^linux-wallpaperengine' || true; }
 
 start() {
@@ -46,13 +77,38 @@ start() {
     while read -r mon id; do
         [[ -n "${mon:-}" && -n "${id:-}" ]] && args+=(--screen-root "$mon" --bg "$id")
     done <"$CONF"
+
+    local first_mon first_id sync=0
+    read -r first_mon first_id <"$CONF"
+    local frame="$CACHE/frame-$first_id.png"
+    # a newer start supersedes any capture still in flight
+    [[ -f "$CACHE/sync.pid" ]] && kill "$(cat "$CACHE/sync.pid")" 2>/dev/null || true
+    if [[ "$HYDE_SYNC" == 1 ]] && command -v hyde-shell >/dev/null &&
+        [[ "$(cat "$CACHE/hyde-synced" 2>/dev/null)" != "$first_id" ]]; then
+        sync=1
+        mkdir -p "$CACHE"
+        rm -f "$frame"
+        [[ -s "$CACHE/stills/$first_id.png" ]] || args+=(--screenshot "$frame" --screenshot-delay 90)
+    fi
+
     cd "$WORKSHOP"
     setsid -f linux-wallpaperengine --assets-dir "$ASSETS" "${EXTRA_ARGS[@]}" "${args[@]}" >"$LOG" 2>&1
+    if [[ $sync == 1 ]]; then
+        bash -c "$(declare -f monitor_geometry hyde_sync); CACHE='$CACHE'; hyde_sync \"\$@\"" \
+            _ "$first_mon" "$first_id" "$frame" >>"$LOG" 2>&1 </dev/null &
+        echo $! >"$CACHE/sync.pid"
+        disown
+    fi
 }
 
 case "${1:-}" in
 start) start ;;
 stop) stop ;;
+sync)
+    read -r _ id <"$CONF"
+    rm -f "$CACHE/hyde-synced" "$CACHE/stills/$id.png"
+    start
+    ;;
 list)
     for d in "$WORKSHOP"/*/; do
         python3 -I -c 'import json,sys;j=json.load(open(sys.argv[1]));print(sys.argv[2], (j.get("type") or "?").lower(), j.get("title"), sep="\t")' \
