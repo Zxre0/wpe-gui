@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Wallpaper Engine
+GenericName=Live Wallpaper Picker
+Comment=Pick Wallpaper Engine wallpapers for Hyprland
+Exec=wpe-gui
+Icon=preferences-desktop-wallpaper
+Categories=Settings;DesktopSettings;
+Keywords=wallpaper;background;live;engine;
+StartupNotify=true

@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""Wallpaper picker for linux-wallpaperengine (drives ~/.local/bin/wpe)."""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import warnings
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, GdkPixbuf, GLib, Gtk  # noqa: E402
+
+HOME = Path.home()
+
+
+def find_steam():
+    if os.environ.get("WPE_STEAM_DIR"):
+        return Path(os.environ["WPE_STEAM_DIR"])
+    for d in (".local/share/Steam", ".steam/steam", ".var/app/com.valvesoftware.Steam/.local/share/Steam"):
+        if (HOME / d / "steamapps/common/wallpaper_engine").is_dir():
+            return HOME / d
+    return HOME / ".local/share/Steam"
+
+
+WORKSHOP = find_steam() / "steamapps/workshop/content/431960"
+CONF_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "wpe"
+SCREENS = CONF_DIR / "screens"
+OPTIONS = CONF_DIR / "options"
+WPE = shutil.which("wpe") or str(Path(__file__).resolve().with_name("wpe"))
+THUMB_W, THUMB_H = 320, 180
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+CSS = b"""
+.thumb { border-radius: 10px; }
+.card-btn { padding: 6px; border-radius: 14px; }
+.card-btn.active, .card-btn.active:hover { background: alpha(@accent_bg_color, 0.35);
+                    outline: 3px solid @accent_bg_color; outline-offset: -3px; }
+.type-badge { font-size: 0.75em; font-weight: bold; padding: 1px 7px; border-radius: 99px;
+              background: alpha(@window_fg_color, 0.12); }
+.type-badge.web { background: alpha(@warning_bg_color, 0.35); }
+"""
+
+
+def load_wallpapers():
+    items = []
+    for d in sorted(WORKSHOP.iterdir()) if WORKSHOP.is_dir() else []:
+        try:
+            meta = json.loads((d / "project.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        preview = next((d / p for p in (meta.get("preview"), "preview.jpg", "preview.gif", "preview.png")
+                        if p and (d / p).is_file()), None)
+        items.append({
+            "id": d.name,
+            "title": (meta.get("title") or d.name).strip(),
+            "type": (meta.get("type") or "?").lower(),
+            "preview": preview,
+        })
+    return items
+
+
+def read_screens():
+    out = {}
+    try:
+        for line in SCREENS.read_text().splitlines():
+            parts = line.split()
+            if len(parts) == 2:
+                out[parts[0]] = parts[1]
+    except OSError:
+        pass
+    return out
+
+
+def read_options():
+    opts = {"SILENT": "1", "FPS": "60", "VOLUME": "15"}
+    try:
+        for line in OPTIONS.read_text().splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                k, v = line.split("=", 1)
+                opts[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return opts
+
+
+def write_options(opts):
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    OPTIONS.write_text("".join(f"{k}={v}\n" for k, v in opts.items()))
+
+
+def monitors():
+    try:
+        out = subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True, text=True, check=True).stdout
+        return [m["name"] for m in json.loads(out)]
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return []
+
+
+def is_running():
+    return subprocess.run(["pgrep", "-x", "linux-wallpaper"], capture_output=True).returncode == 0
+
+
+def load_thumb(path):
+    try:
+        pb = GdkPixbuf.Pixbuf.new_from_file(str(path))
+    except GLib.Error:
+        return None
+    # scale to cover THUMB_W x THUMB_H, then crop the centre
+    k = max(THUMB_W / pb.get_width(), THUMB_H / pb.get_height())
+    w, h = max(THUMB_W, round(pb.get_width() * k)), max(THUMB_H, round(pb.get_height() * k))
+    pb = pb.scale_simple(w, h, GdkPixbuf.InterpType.BILINEAR)
+    return pb.new_subpixbuf((w - THUMB_W) // 2, (h - THUMB_H) // 2, THUMB_W, THUMB_H).copy()
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Wallpapers", default_width=1180, default_height=780)
+        self.items = load_wallpapers()
+        self.monitors = monitors()
+        self.cards = {}
+        self.pool = ThreadPoolExecutor(max_workers=4)
+
+        header = Adw.HeaderBar()
+        self.search = Gtk.SearchEntry(placeholder_text="Search wallpapers", width_chars=28)
+        self.search.connect("search-changed", lambda *_: self.flow.invalidate_filter())
+        header.set_title_widget(self.search)
+
+        self.mon_choices = ["All monitors", *self.monitors]
+        self.mon_drop = Gtk.DropDown.new_from_strings(self.mon_choices)
+        self.mon_drop.set_tooltip_text("Apply to")
+        self.mon_drop.connect("notify::selected", lambda *_: self.refresh_active())
+        header.pack_start(self.mon_drop)
+
+        self.types = ["All types", "Scene", "Video", "Web"]
+        self.type_drop = Gtk.DropDown.new_from_strings(self.types)
+        self.type_drop.connect("notify::selected", lambda *_: self.flow.invalidate_filter())
+        header.pack_start(self.type_drop)
+
+        self.power = Gtk.ToggleButton(icon_name="media-playback-start-symbolic", tooltip_text="Wallpaper running")
+        self.power.set_active(is_running())
+        self._sync_power_icon()
+        self.power.connect("toggled", self.on_power)
+        header.pack_end(self.power)
+
+        menu_btn = Gtk.MenuButton(icon_name="emblem-system-symbolic", tooltip_text="Settings")
+        menu_btn.set_popover(self.build_settings())
+        header.pack_end(menu_btn)
+
+        self.flow = Gtk.FlowBox(
+            valign=Gtk.Align.START, selection_mode=Gtk.SelectionMode.NONE, homogeneous=True,
+            max_children_per_line=8, min_children_per_line=2, row_spacing=6, column_spacing=6,
+            margin_top=12, margin_bottom=12, margin_start=12, margin_end=12,
+        )
+        self.flow.set_filter_func(self.filter)
+        for it in self.items:
+            self.flow.append(self.build_card(it))
+
+        scroller = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroller.set_child(self.flow)
+
+        self.toasts = Adw.ToastOverlay(child=scroller)
+        view = Adw.ToolbarView(content=self.toasts)
+        view.add_top_bar(header)
+        self.set_content(view)
+
+        if not self.items:
+            self.toasts.add_toast(Adw.Toast(title="No Workshop wallpapers found", timeout=0))
+        self.refresh_active()
+
+    # ---- UI pieces -------------------------------------------------------
+    def build_card(self, it):
+        pic = Gtk.Picture(content_fit=Gtk.ContentFit.COVER, can_shrink=False, overflow=Gtk.Overflow.HIDDEN,
+                          width_request=THUMB_W, height_request=THUMB_H)
+        pic.add_css_class("thumb")
+        if it["preview"]:
+            self.pool.submit(self._load_async, pic, it["preview"])
+
+        title = Gtk.Label(label=it["title"], ellipsize=3, xalign=0, hexpand=True, max_width_chars=1)
+        badge = Gtk.Label(label=it["type"])
+        badge.add_css_class("type-badge")
+        badge.add_css_class(it["type"])
+        row = Gtk.Box(spacing=6, margin_top=4)
+        row.append(title)
+        row.append(badge)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.append(pic)
+        box.append(row)
+
+        btn = Gtk.Button(child=box, tooltip_text=f"{it['title']}\n{it['id']}", halign=Gtk.Align.CENTER)
+        btn.add_css_class("flat")
+        btn.add_css_class("card-btn")
+        btn.connect("clicked", lambda *_: self.apply(it))
+        self.cards[it["id"]] = btn
+        child = Gtk.FlowBoxChild(child=btn, focusable=False)
+        child.item = it
+        return child
+
+    def build_settings(self):
+        opts = read_options()
+        grid = Gtk.Grid(row_spacing=10, column_spacing=16, margin_top=8, margin_bottom=8,
+                        margin_start=8, margin_end=8)
+
+        mute = Gtk.Switch(active=opts["SILENT"] == "1", halign=Gtk.Align.END)
+        vol = Gtk.SpinButton.new_with_range(0, 100, 5)
+        vol.set_value(float(opts["VOLUME"]))
+        vol.set_sensitive(not mute.get_active())
+        fps = Gtk.SpinButton.new_with_range(10, 240, 5)
+        fps.set_value(float(opts["FPS"]))
+
+        for r, (label, w) in enumerate([("Mute sound", mute), ("Volume", vol), ("FPS limit", fps)]):
+            grid.attach(Gtk.Label(label=label, xalign=0), 0, r, 1, 1)
+            grid.attach(w, 1, r, 1, 1)
+
+        def save(*_):
+            vol.set_sensitive(not mute.get_active())
+            write_options({"SILENT": "1" if mute.get_active() else "0",
+                           "FPS": str(int(fps.get_value())), "VOLUME": str(int(vol.get_value()))})
+
+        apply_btn = Gtk.Button(label="Apply", css_classes=["suggested-action"])
+        apply_btn.connect("clicked", lambda *_: (save(), self.run_wpe(["start"], "Settings applied")))
+        grid.attach(apply_btn, 0, 3, 2, 1)
+        mute.connect("notify::active", save)
+        vol.connect("value-changed", save)
+        fps.connect("value-changed", save)
+
+        return Gtk.Popover(child=grid)
+
+    # ---- behaviour -------------------------------------------------------
+    def _load_async(self, pic, path):
+        pb = load_thumb(path)
+        if pb:
+            GLib.idle_add(lambda: (pic.set_paintable(Gdk.Texture.new_for_pixbuf(pb)), False)[1])
+
+    def filter(self, child):
+        it = child.item
+        q = self.search.get_text().strip().lower()
+        if q and q not in it["title"].lower() and q not in it["id"]:
+            return False
+        t = self.types[self.type_drop.get_selected()].lower()
+        return t == "all types" or it["type"] == t
+
+    def target(self):
+        i = self.mon_drop.get_selected()
+        return None if i == 0 else self.mon_choices[i]
+
+    def refresh_active(self):
+        screens = read_screens()
+        mon = self.target()
+        active = {screens.get(mon)} if mon else set(screens.values())
+        for wid, btn in self.cards.items():
+            (btn.add_css_class if wid in active else btn.remove_css_class)("active")
+
+    def apply(self, it):
+        mon = self.target()
+        args = ["set", it["id"]] + ([mon] if mon else [])
+        where = mon or "all monitors"
+        msg = f"{it['title']} → {where}"
+        if it["type"] == "web":
+            msg += " (web wallpapers may not render)"
+        self.run_wpe(args, msg)
+
+    def run_wpe(self, args, msg):
+        def work():
+            r = subprocess.run([WPE, *args], capture_output=True, text=True)
+            GLib.idle_add(self._done, r, msg)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _done(self, r, msg):
+        if r.returncode == 0:
+            self.toasts.add_toast(Adw.Toast(title=GLib.markup_escape_text(msg), timeout=2))
+        else:
+            err = (r.stderr or r.stdout or "wpe failed").strip().splitlines()[-1]
+            self.toasts.add_toast(Adw.Toast(title=GLib.markup_escape_text(err), timeout=5))
+        self.refresh_active()
+        self.power.handler_block_by_func(self.on_power)
+        self.power.set_active(is_running())
+        self.power.handler_unblock_by_func(self.on_power)
+        self._sync_power_icon()
+        return False
+
+    def _sync_power_icon(self):
+        on = self.power.get_active()
+        self.power.set_icon_name("media-playback-pause-symbolic" if on else "media-playback-start-symbolic")
+        self.power.set_tooltip_text("Stop wallpaper" if on else "Start wallpaper")
+
+    def on_power(self, btn):
+        self._sync_power_icon()
+        if btn.get_active():
+            self.run_wpe(["start"], "Wallpaper started")
+        else:
+            self.run_wpe(["stop"], "Wallpaper stopped")
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="local.wpe.Picker")
+
+    def do_activate(self):
+        win = self.props.active_window
+        if not win:
+            css = Gtk.CssProvider()
+            css.load_from_data(CSS)
+            Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css,
+                                                      Gtk.STYLE_PROVIDER_PRIORITY_USER + 10)
+            win = Window(self)
+        win.present()
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

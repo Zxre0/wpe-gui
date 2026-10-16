@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# wpe - small wrapper around linux-wallpaperengine for Hyprland
+#   wpe start                 launch using saved per-monitor wallpapers
+#   wpe stop                  kill the running instance
+#   wpe list                  list Workshop wallpapers (id, type, title)
+#   wpe set <id|title> [mon]  set wallpaper on a monitor (default: all) and restart
+set -euo pipefail
+
+if [[ -z "${WPE_STEAM_DIR:-}" ]]; then
+    for d in "$HOME/.local/share/Steam" "$HOME/.steam/steam" "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"; do
+        [[ -d "$d/steamapps/common/wallpaper_engine" ]] && { WPE_STEAM_DIR="$d"; break; }
+    done
+fi
+STEAM="${WPE_STEAM_DIR:-$HOME/.local/share/Steam}"
+WORKSHOP="$STEAM/steamapps/workshop/content/431960"
+ASSETS="$STEAM/steamapps/common/wallpaper_engine/assets"
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/wpe/screens"
+LOG="${XDG_CACHE_HOME:-$HOME/.cache}/wpe.log"
+OPTS="${XDG_CONFIG_HOME:-$HOME/.config}/wpe/options"
+
+# defaults, overridable in $OPTS (shell syntax, e.g. SILENT=0)
+SILENT=1
+FPS=60
+VOLUME=15
+[[ -f "$OPTS" ]] && source "$OPTS"
+EXTRA_ARGS=(--fps "$FPS")
+if [[ "$SILENT" == 1 ]]; then EXTRA_ARGS+=(--silent); else EXTRA_ARGS+=(--volume "$VOLUME"); fi
+
+monitors() { hyprctl monitors -j | python3 -I -c 'import json,sys;[print(m["name"]) for m in json.load(sys.stdin)]'; }
+
+resolve() {
+    local q="$1"
+    if [[ -d "$WORKSHOP/$q" ]]; then echo "$q"; return; fi
+    local hit
+    hit=$(grep -il "\"title\" *: *\".*${q}.*\"" "$WORKSHOP"/*/project.json | head -1) || true
+    [[ -n "$hit" ]] || { echo "no wallpaper matching '$q'" >&2; exit 1; }
+    basename "$(dirname "$hit")"
+}
+
+stop() { pkill -x linux-wallpaper || pkill -f '^linux-wallpaperengine' || true; }
+
+start() {
+    [[ -f "$CONF" ]] || { echo "no wallpapers set yet; try: wpe set 'Misty forest'" >&2; exit 1; }
+    stop
+    local args=()
+    while read -r mon id; do
+        [[ -n "${mon:-}" && -n "${id:-}" ]] && args+=(--screen-root "$mon" --bg "$id")
+    done <"$CONF"
+    cd "$WORKSHOP"
+    setsid -f linux-wallpaperengine --assets-dir "$ASSETS" "${EXTRA_ARGS[@]}" "${args[@]}" >"$LOG" 2>&1
+}
+
+case "${1:-}" in
+start) start ;;
+stop) stop ;;
+list)
+    for d in "$WORKSHOP"/*/; do
+        python3 -I -c 'import json,sys;j=json.load(open(sys.argv[1]));print(sys.argv[2], (j.get("type") or "?").lower(), j.get("title"), sep="\t")' \
+            "$d/project.json" "$(basename "$d")" 2>/dev/null || true
+    done | sort -k2
+    ;;
+set)
+    id=$(resolve "${2:?usage: wpe set <id|title> [monitor]}")
+    target="${3:-all}"
+    mkdir -p "$(dirname "$CONF")"
+    touch "$CONF"
+    if [[ "$target" == all ]]; then
+        monitors | while read -r m; do echo "$m $id"; done >"$CONF"
+    else
+        { grep -v "^$target " "$CONF" || true; echo "$target $id"; } >"$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+    fi
+    start
+    ;;
+*) sed -n '2,6p' "$0" | sed 's/^# \?//'; exit 1 ;;
+esac
